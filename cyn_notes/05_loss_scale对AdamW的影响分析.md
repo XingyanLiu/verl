@@ -6,9 +6,15 @@
 
 ## 背景
 
-verl v0.7+ 引入了全局归一化机制（`agg_loss`），使得 loss 值"并行度无关"（parallelism-agnostic）。
-假设新版本框架在 `token-mean` 模式下计算的 loss 是旧版本的 **1/K**
-（K 取决于 gradient accumulation steps 数和并行设置，本文假设 K=32 作为示例）。
+verl v0.7+ 在 `dp_actor.py` 中引入了 `loss_scale_factor = 1/K` 来缩放 loss，
+使得每个 micro-batch 的 backward loss 缩小了 K 倍。
+
+**K 的精确定义**（详见 `07_缩放因子K的精确推导.md`）：
+```
+K = ppo_mini_batch_size / ppo_micro_batch_size_per_gpu
+```
+其中 `ppo_mini_batch_size` 是全局值。**K 与 dp_size（GPU 数量）无关。**
+（本文假设 K=32 作为示例。）
 
 **两个分析场景**：
 
