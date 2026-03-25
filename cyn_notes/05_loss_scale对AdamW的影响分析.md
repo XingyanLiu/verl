@@ -335,9 +335,10 @@ BFloat16 的特性：
 #### FP16 精度（如果使用）
 
 如果使用 FP16（verl 支持但非默认）：
-- 最小正规格化数：~6.1e-5
-- `loss ≈ 3.125e-5` 已经接近下溢风险！
-- verl 使用 `ShardedGradScaler` 来处理 FP16 下溢，但额外的 loss 缩小可能增加 scaler 的压力
+- 最小正规格化数（normal）：~6.1e-5；最小非规格化数（denormal）：~5.96e-8
+- `loss ≈ 3.125e-5` 低于正规格化阈值，会以非规格化数表示，精度降低
+- 虽然不会真正下溢到零，但精度损失（尾数有效位减少）可能影响训练质量
+- verl 使用 `ShardedGradScaler` 来处理 FP16 精度问题，但额外的 loss 缩小可能增加 scaler 的压力
 
 **建议**：如果使用 FP16，需要特别注意 GradScaler 的行为。
 
