@@ -1,20 +1,21 @@
-# Loss Scale 变更对 AdamW 优化器的影响分析
+# ~~Loss Scale 变更对 AdamW 优化器的影响分析~~ (已废弃)
 
-> 本文档分析 verl 版本升级（v0.3.x → v0.7+）导致的 loss scale 变化对训练的理论和实践影响。
+> **⚠️ 本文档已废弃**
+>
+> 本文档基于错误前提：v0.7 引入了新的 loss 缩放（1/K），导致与 v0.3 存在 K 倍梯度差异。
+>
+> **经仔细审查源码后发现：v0.3 和 v0.7 在 dp_actor 路径下的 loss 缩放完全相同。**
+> 两个版本都除以 K = ppo_mini_batch_size / ppo_micro_batch_size_per_gpu。
+> 不存在版本间的 K 倍梯度差异。
+>
+> 因此，本文档中关于"loss 缩放 1/K 导致 AdamW 行为变化"的分析不适用于 v0.3→v0.7 迁移。
+> 但如果用户基于其他原因需要理解 AdamW 在 loss 缩放下的行为，以下分析作为纯理论参考可能仍有价值。
+>
+> 详见 `07_缩放因子K的精确推导.md`（修正版）。
 
 ---
 
-## 背景
-
-verl v0.7+ 在 `dp_actor.py` 中引入了 `loss_scale_factor = 1/K` 来缩放 loss，
-使得每个 micro-batch 的 backward loss 缩小了 K 倍。
-
-**K 的精确定义**（详见 `07_缩放因子K的精确推导.md`）：
-```
-K = ppo_mini_batch_size / ppo_micro_batch_size_per_gpu
-```
-其中 `ppo_mini_batch_size` 是全局值。**K 与 dp_size（GPU 数量）无关。**
-（本文假设 K=32 作为示例。）
+> **以下为原始分析内容（仅作理论参考，不适用于 v0.3→v0.7 迁移）**
 
 **两个分析场景**：
 
