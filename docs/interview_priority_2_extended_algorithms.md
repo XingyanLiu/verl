@@ -1,61 +1,350 @@
-# VeRL核心算法代码解析 - 优先级2
+# VeRL核心算法代码解析 - 优先级2 (进阶算法)
 
-> **扩展算法**: ./recipe目录算法 + 其他核心算法变体
-
----
-
-## 目录
-
-1. [On-Policy Distillation](#1-on-policy-distillation-在线策略蒸馏)
-2. [其他Advantage Estimator变体](#2-其他advantage-estimator变体)
-   - [RLOO](#21-rloo-reinforcement-learning-from-leave-one-out)
-   - [REINFORCE++](#22-reinforce)
-   - [ReMax](#23-remax)
-   - [GDPO](#24-gdpo-group-decoupled-policy-optimization)
-   - [OPO](#25-opo)
-   - [Optimal Token Baseline](#26-optimal-token-baseline)
-3. [Policy Loss变体](#3-policy-loss变体)
-   - [DPPO (Divergence-Constrained PPO)](#31-dppo-divergence-constrained-ppo)
-   - [GSPO (Geometric Sequence PPO)](#32-gspo-geometric-sequence-ppo)
-   - [SAPO (Smoothed Advantage Policy Optimization)](#33-sapo-smoothed-advantage-policy-optimization)
-   - [GPG (Group Policy Gradient)](#34-gpg-group-policy-gradient)
-   - [GMPO (Geometric Mean Policy Optimization)](#35-gmpo-geometric-mean-policy-optimization)
-   - [CISPO (Clipped Importance Sampling PO)](#36-cispo-clipped-importance-sampling-po)
+> **扩展算法**: Recipe Submodule算法 (DAPO, SPIN/DPO等) + 核心算法变体
+> 
+> 本文档深入浅出地解释每个算法的**核心思想**、**数学公式**、**代码实现**、**工程考虑**和**个人见解**。
 
 ---
 
-## 注意事项
+## 📚 目录
 
-**关于 `./recipe` 目录**: 经检查，该目录当前为空。本文档涵盖的扩展算法主要来自 `./verl/trainer/ppo/core_algos.py` 和 `./verl/trainer/distillation/` 中的实现。
+1. [Recipe Submodule 算法](#1-recipe-submodule-算法)
+   - [1.1 DAPO (Decoupled Alignment via Policy Optimization)](#11-dapo)
+   - [1.2 SPIN/DPO (Self-Play / Direct Preference Optimization)](#12-spindpo)
+2. [On-Policy Distillation](#2-on-policy-distillation)
+3. [其他Advantage Estimator变体](#3-其他advantage-estimator变体)
+   - [RLOO](#31-rloo)
+   - [REINFORCE++](#32-reinforce)
+   - [ReMax](#33-remax)
+   - [GDPO](#34-gdpo)
+   - [OPO](#35-opo)
+   - [Optimal Token Baseline](#36-optimal-token-baseline)
+4. [Policy Loss变体](#4-policy-loss变体)
+   - [DPPO](#41-dppo)
+   - [GSPO](#42-gspo)
+   - [SAPO](#43-sapo)
+   - [GPG](#44-gpg)
+   - [GMPO](#45-gmpo)
+   - [CISPO](#46-cispo)
 
 ---
 
-## 1. On-Policy Distillation (在线策略蒸馏)
+## 📍 关于Recipe Submodule
+
+**位置**: `./recipe` 是一个Git Submodule，指向 [verl-project/verl-recipe](https://github.com/verl-project/verl-recipe)
+
+Recipe包含了VeRL社区实现的各种进阶算法和训练脚本，包括：
+- DAPO, SPIN, SPO, SPPO
+- R1 reasoning models
+- GKD (Generalized Knowledge Distillation)
+- 各种实验性算法
+
+---
+
+## 1. Recipe Submodule 算法
+
+### 1.1 DAPO (Decoupled Alignment via Policy Optimization)
+
+**文件位置**: `recipe/dapo/`
+
+#### 💡 核心思想
+
+DAPO是一种改进的PPO训练方法，核心创新是**解耦对齐**：把奖励信号和KL约束分开处理。
+
+**传统PPO的问题**:
+- KL惩罚直接加在loss里，可能压制有效学习
+- 奖励和约束信号混在一起，难以平衡
+
+**DAPO的解决方案**:
+- 先用纯奖励信号更新策略
+- 然后用KL约束进行"回拉"
+- 两步解耦，更容易控制
+
+#### 🔧 关键代码
+
+```python
+# recipe/dapo/dapo_ray_trainer.py
+class RayDAPOTrainer(RayPPOTrainer):
+    """
+    DAPO训练器，继承自标准PPO训练器
+    
+    【核心改进】
+    1. 重新计算old_log_prob时同时计算entropy
+    2. 更灵活的KL控制
+    """
+    
+    def compute_kl_related_metrics(self, batch: DataProto, metrics: dict, timing_raw: dict):
+        """
+        计算KL相关指标
+        
+        【工程优化】
+        - 在重新计算old_log_prob时顺便计算entropy
+        - 避免额外的forward pass
+        """
+        batch.batch["response_mask"] = compute_response_mask(batch)
+        
+        with marked_timer("old_log_prob", timing_raw, "blue"):
+            old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
+            
+            # 【关键】同时获取entropy
+            entropys = old_log_prob.batch["entropys"]
+            response_masks = batch.batch["response_mask"]
+            
+            # 聚合entropy
+            entropy_agg = agg_loss(
+                loss_mat=entropys,
+                loss_mask=response_masks,
+                loss_agg_mode=actor_config.loss_agg_mode,
+                loss_scale_factor=actor_config.loss_scale_factor,
+            )
+            
+            old_log_prob_metrics = {
+                "actor/entropy": entropy_agg.detach().item(),
+                "perf/mfu/actor_infer": old_log_prob_mfu,
+            }
+            metrics.update(old_log_prob_metrics)
+        
+        if self.use_reference_policy:
+            # 计算reference log_prob用于KL约束
+            with marked_timer("ref", timing_raw, "olive"):
+                ref_log_prob = self._compute_ref_log_prob(batch)
+                batch = batch.union(ref_log_prob)
+        
+        return batch
+```
+
+#### 📊 DAPO vs 标准PPO对比
+
+| 特性 | 标准PPO | DAPO |
+|------|---------|------|
+| KL处理 | loss中直接惩罚 | 解耦处理 |
+| 训练步骤 | 单步更新 | 可能多步 |
+| 灵活性 | 固定流程 | 更灵活 |
+| 适用场景 | 通用 | 大规模对齐 |
+
+#### 🎓 工程考虑
+
+1. **为什么要解耦？**
+   - KL惩罚可能过强，阻碍学习
+   - 解耦后可以先学习再约束
+   - 更容易调参
+
+2. **计算优化**
+   - entropy在forward pass中顺便计算
+   - 不需要额外的模型调用
+
+---
+
+### 1.2 SPIN/DPO (Self-Play / Direct Preference Optimization)
+
+**文件位置**: `recipe/spin/`
+
+#### 💡 核心思想
+
+SPIN结合了Self-Play和DPO的思想：
+- **Self-Play**: 用模型自己的输出作为负样本
+- **DPO**: 直接从偏好数据学习，不需要显式奖励模型
+
+**DPO的数学原理**:
+把RLHF的奖励最大化问题转化为分类问题：
+
+```math
+\mathcal{L}_{\text{DPO}} = -\log \sigma \left( \beta \left[ \log \frac{\pi_\theta(y_w|x)}{\pi_{\text{ref}}(y_w|x)} - \log \frac{\pi_\theta(y_l|x)}{\pi_{\text{ref}}(y_l|x)} \right] \right)
+```
+
+其中:
+- `y_w`: chosen (获胜) response
+- `y_l`: rejected (失败) response
+- `β`: 温度参数，控制偏好强度
+
+#### 🔧 核心代码
+
+```python
+# recipe/spin/core_algos.py
+
+def compute_onlinedpo_pref(
+    token_level_rewards: torch.Tensor,  # (bs*2, response_length)
+    response_mask: torch.Tensor,        # (bs*2, response_length)
+) -> torch.Tensor:
+    """
+    根据奖励确定偏好对
+    
+    【输入假设】
+    数据是交错排列的: [Resp1_Prompt0, Resp2_Prompt0, Resp1_Prompt1, Resp2_Prompt1, ...]
+    每两个response来自同一个prompt
+    
+    【输出】
+    布尔mask，True表示该response是chosen（获胜方）
+    """
+    # 检查输入
+    if token_level_rewards.shape[0] % 2 != 0:
+        raise ValueError("Batch size must be even for pair comparison")
+    
+    # 1. 计算每个response的总分
+    scores = (token_level_rewards * response_mask).sum(dim=-1)  # (bs*2,)
+    
+    # 2. 重塑为pair: (num_pairs, 2)
+    score_pairs = scores.view(-1, 2)
+    
+    # 3. 找出每对中的获胜者
+    # argmax返回: 0表示第一个response更好，1表示第二个更好
+    winner_indices = torch.argmax(score_pairs, dim=1)  # (num_pairs,)
+    
+    # 4. 构建获胜者mask
+    num_pairs = score_pairs.shape[0]
+    pair_indices = torch.arange(num_pairs, device=scores.device)
+    winner_global_indices = (pair_indices * 2) + winner_indices
+    
+    output_preference_mask = torch.zeros(num_pairs * 2, dtype=torch.bool, device=scores.device)
+    output_preference_mask[winner_global_indices] = True
+    
+    return output_preference_mask
+
+
+def compute_online_dpo_loss(
+    policy_chosen_logps: torch.Tensor,     # 策略在chosen上的log概率
+    policy_rejected_logps: torch.Tensor,   # 策略在rejected上的log概率
+    reference_chosen_logps: torch.Tensor,  # 参考策略在chosen上的log概率
+    reference_rejected_logps: torch.Tensor,# 参考策略在rejected上的log概率
+    beta: float,                           # 温度参数
+    label_smoothing: float = 0.0,          # 标签平滑
+    loss_type: str = "sigmoid",            # 损失类型
+    reference_free: bool = False,          # 是否不使用参考策略
+) -> torch.Tensor:
+    """
+    计算DPO损失
+    
+    【数学公式】
+    L_DPO = -log σ(β * (log(π/π_ref)_chosen - log(π/π_ref)_rejected))
+    
+    【变体支持】
+    - sigmoid: 标准DPO
+    - ipo: IPO变体 (Inverse Probability of Outcome)
+    """
+    import torch.nn.functional as F
+    
+    # 计算policy的log ratio
+    pi_logratios = policy_chosen_logps - policy_rejected_logps
+    
+    # 计算reference的log ratio
+    ref_logratios = reference_chosen_logps - reference_rejected_logps
+    
+    if reference_free:
+        # 不使用参考策略（类似RLHF但无ref）
+        ref_logratios = torch.zeros_like(pi_logratios)
+    
+    # 组合得到最终logits
+    logits = pi_logratios - ref_logratios
+    
+    # 根据损失类型计算
+    if loss_type == "sigmoid":
+        # 标准DPO: -log σ(β * logits)
+        # 加上label smoothing增强鲁棒性
+        losses = (-F.logsigmoid(beta * logits) * (1 - label_smoothing) 
+                  - F.logsigmoid(-beta * logits) * label_smoothing)
+    elif loss_type == "ipo":
+        # IPO: (logits - 1/(2β))²
+        losses = (logits - 1 / (2 * beta)) ** 2
+    else:
+        raise ValueError(f"Unsupported loss_type: {loss_type}")
+    
+    return losses.mean()
+
+
+def get_batch_logps(
+    logits: torch.FloatTensor,   # (batch_size, seq_len, vocab_size)
+    labels: torch.LongTensor,    # (batch_size, seq_len)
+    average_log_prob: bool = False
+) -> torch.FloatTensor:
+    """
+    计算batch中每个序列的log概率
+    
+    【关键细节】
+    - 需要shift对齐：logits[:-1] 预测 labels[1:]
+    - 处理padding token (label=-100)
+    """
+    # Shift对齐
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+    
+    # 计算每个token的log概率
+    loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100, reduction="none")
+    per_token_logps = -loss_fct(
+        shift_logits.view(-1, shift_logits.size(-1)), 
+        shift_labels.view(-1)
+    )
+    per_token_logps = per_token_logps.view(shift_logits.size(0), shift_logits.size(1))
+    
+    # 创建mask（忽略padding）
+    loss_mask = shift_labels != -100
+    masked_logps = per_token_logps * loss_mask
+    
+    # 求和得到序列log概率
+    sequence_logps = masked_logps.sum(dim=-1)
+    
+    if average_log_prob:
+        # 可选：除以有效token数
+        num_valid_tokens = loss_mask.sum(dim=-1)
+        return sequence_logps / torch.clamp(num_valid_tokens, min=1)
+    else:
+        return sequence_logps
+```
+
+#### 📊 DPO vs RLHF对比
+
+| 特性 | RLHF (PPO) | DPO |
+|------|------------|-----|
+| 需要RM | ✓ | ✗ |
+| 训练稳定性 | 需要调参 | 更稳定 |
+| 计算开销 | 高（多模型） | 低（单模型） |
+| 适用场景 | 灵活 | 偏好数据充足 |
+
+#### 🎓 工程考虑 & 个人见解
+
+1. **Online vs Offline DPO**
+   - Offline DPO: 用固定的偏好数据
+   - Online DPO (如SPIN): 动态生成偏好对
+   - Online更灵活但计算开销更大
+
+2. **β参数的选择**
+   - 太小(0.01): 偏好信号弱，学习慢
+   - 太大(1.0): 可能过拟合chosen
+   - 通常从0.1开始调
+
+3. **Label Smoothing的作用**
+   - 防止模型过度自信
+   - 对噪声标签更鲁棒
+
+---
+
+## 2. On-Policy Distillation (在线策略蒸馏)
 
 **文件位置**: 
 - 配置: `verl/workers/config/distillation.py`
 - 损失函数: `verl/trainer/distillation/losses.py`
 - 文档: `docs/advance/async-on-policy-distill.md`
 
-### 1.1 概述
+#### 💡 核心思想
 
-On-Policy Knowledge Distillation训练学生策略模仿更强的教师，使用学生当前策略生成的样本。对于每个on-policy rollout，教师返回soft top-k token分布，学生使用token级sparse KL目标进行优化。
+On-Policy Knowledge Distillation训练学生策略模仿更强的教师，**使用学生当前策略生成的样本**。
 
-### 1.2 核心配置
+**为什么On-Policy？**
+- Off-policy蒸馏：用教师生成数据，学生在自己的分布上可能表现差
+- On-policy蒸馏：用学生生成数据，避免分布偏移
+
+#### 🔧 核心配置
 
 ```python
-# verl/workers/config/distillation.py: 31-112
+# verl/workers/config/distillation.py
 @dataclass
 class DistillationLossConfig(BaseConfig):
     """
     蒸馏损失配置
     """
-    loss_mode: str = "k3"  # 损失类型: "k1", "k2", "k3", "forward_kl_topk"等
+    loss_mode: str = "k3"  # 损失类型: "k1", "k2", "k3", "forward_kl_topk"
     topk: Optional[int] = 128  # top-k token数量
     use_task_rewards: bool = True  # 是否结合任务奖励
     distillation_loss_coef: float = 1.0  # 蒸馏损失系数
-    loss_max_clamp: Optional[float] = 10.0  # 最大裁剪值
-    log_prob_min_clamp: Optional[float] = -10.0  # log概率最小裁剪
     
     # Policy Gradient结合蒸馏
     use_policy_gradient: bool = True  # 是否使用PG方式
@@ -222,9 +511,9 @@ def distillation_loss(...):
 
 ---
 
-## 2. 其他Advantage Estimator变体
+## 3. 其他Advantage Estimator变体
 
-### 2.1 RLOO (Reinforcement Learning from Leave-One-Out)
+### 3.1 RLOO (Reinforcement Learning from Leave-One-Out)
 
 **文件位置**: `verl/trainer/ppo/core_algos.py: 587-636`
 
@@ -308,7 +597,7 @@ def compute_rloo_vectorized_outcome_advantage(...):
     return adv, adv
 ```
 
-### 2.2 REINFORCE++
+### 3.2 REINFORCE++
 
 **文件位置**: `verl/trainer/ppo/core_algos.py: 693-729`
 
@@ -352,7 +641,7 @@ def compute_reinforce_plus_plus_outcome_advantage(
     return advantages, returns
 ```
 
-### 2.3 ReMax
+### 3.3 ReMax
 
 **文件位置**: `verl/trainer/ppo/core_algos.py: 732-765`
 
@@ -385,7 +674,7 @@ def compute_remax_outcome_advantage(
     return advantages, returns
 ```
 
-### 2.4 GDPO (Group Decoupled Policy Optimization)
+### 3.4 GDPO (Group Decoupled Policy Optimization)
 
 **文件位置**: `verl/trainer/ppo/core_algos.py: 361-468`
 
@@ -454,7 +743,7 @@ def compute_gdpo_outcome_advantage(
     return advantages, advantages
 ```
 
-### 2.5 OPO
+### 3.5 OPO
 
 **文件位置**: `verl/trainer/ppo/core_algos.py: 639-690`
 
@@ -505,7 +794,7 @@ def compute_opo_outcome_advantage(
     return scores, scores
 ```
 
-### 2.6 Optimal Token Baseline
+### 3.6 Optimal Token Baseline
 
 **文件位置**: `verl/trainer/ppo/core_algos.py: 869-985`
 
@@ -588,9 +877,9 @@ def compute_optimal_token_baseline_advantage(
 
 ---
 
-## 3. Policy Loss变体
+## 4. Policy Loss变体
 
-### 3.1 DPPO (Divergence-Constrained PPO)
+### 4.1 DPPO (Divergence-Constrained PPO)
 
 **文件位置**: `verl/trainer/ppo/core_algos.py: 1372-1535`
 
@@ -647,7 +936,7 @@ def compute_policy_loss_dppo_kl(...):
     return pg_loss, pg_metrics
 ```
 
-### 3.2 GSPO (Geometric Sequence PPO)
+### 4.2 GSPO (Geometric Sequence PPO)
 
 **文件位置**: `verl/trainer/ppo/core_algos.py: 1538-1611`
 
@@ -696,7 +985,7 @@ def compute_policy_loss_gspo(
     return pg_loss, pg_metrics
 ```
 
-### 3.3 SAPO (Smoothed Advantage Policy Optimization)
+### 4.3 SAPO (Smoothed Advantage Policy Optimization)
 
 **文件位置**: `verl/trainer/ppo/core_algos.py: 1614-1696`
 
@@ -746,7 +1035,7 @@ def compute_policy_loss_sapo(
     return pg_loss, pg_metrics
 ```
 
-### 3.4 GPG (Group Policy Gradient)
+### 4.4 GPG (Group Policy Gradient)
 
 **文件位置**: `verl/trainer/ppo/core_algos.py: 1699-1732`
 
@@ -773,7 +1062,7 @@ def compute_policy_loss_gpg(
     return pg_loss, {}
 ```
 
-### 3.5 GMPO (Geometric Mean Policy Optimization)
+### 4.5 GMPO (Geometric Mean Policy Optimization)
 
 **文件位置**: `verl/trainer/ppo/core_algos.py: 1920-2003`
 
@@ -822,7 +1111,7 @@ def compute_policy_loss_geo_mean(
     return pg_loss, pg_metrics
 ```
 
-### 3.6 CISPO (Clipped Importance Sampling PO)
+### 4.6 CISPO (Clipped Importance Sampling PO)
 
 **文件位置**: `verl/trainer/ppo/core_algos.py: 2006-2064`
 
