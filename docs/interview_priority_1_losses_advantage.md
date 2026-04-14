@@ -438,28 +438,34 @@ KL惩罚的作用是**防止模型"忘记"它原来学到的能力**。
 
 #### 📐 数学公式
 
-VeRL实现了多种KL估计器，各有优缺点：
+VeRL实现了多种KL估计器（参考 [Schulman 2020](http://joschu.net/blog/kl-approx.html)）。
 
-| 类型 | 数学公式 | 特点 |
-|------|---------|------|
-| k1 (forward) | `log π_θ - log π_ref` | 简单快速，但有偏 |
-| abs | `\|log π_θ - log π_ref\|` | 对称惩罚 |
-| k2 (MSE) | `0.5 * (log π_θ - log π_ref)²` | **无偏梯度**，推荐 |
-| k3 (low-var) | `r - log(r) - 1` | **低方差**，推荐 |
+> **⚠️ 关键区分**: "无偏"有两层含义——**值无偏**（E[estimator] = KL）和**梯度无偏**（E[∇estimator] = ∇KL），两者是不同的！
 
-**k3的推导** (Schulman 2020):
+在PPO中，token由当前策略 `π_θ` 采样，所以估计的是 `KL(π_θ || π_ref)`：
+
+| 类型 | 数学公式 | KL值估计 | 梯度估计 | 特点 |
+|------|---------|---------|---------|------|
+| k1 | `log π_θ - log π_ref` | **无偏** | 有偏 | 可为负值，方差较大 |
+| abs | `\|log π_θ - log π_ref\|` | 有偏 | — | 对称惩罚，始终非负 |
+| k2 (MSE) | `0.5 * (log π_θ - log π_ref)²` | 有偏 | **无偏** | 始终非负 |
+| k3 | `r - log(r) - 1`，`r = π_ref/π_θ` | **无偏** | 有偏 | 始终非负，**低方差** |
+
+**k3为什么好** (Schulman 2020):
+
+k3的推导不依赖任何近似，而是**精确无偏的**。证明如下：
+
+令 `r = π_ref(a)/π_θ(a)`, 则 `k3 = r - log(r) - 1`。对采样分布 `π_θ` 求期望：
 
 ```math
-\text{KL}(\pi_{\text{ref}} \| \pi_\theta) = \mathbb{E}_{\pi_{\text{ref}}}\left[\log \frac{\pi_{\text{ref}}}{\pi_\theta}\right]
+\mathbb{E}_{a \sim \pi_\theta}[k3] = \mathbb{E}_{\pi_\theta}\left[\frac{\pi_{\text{ref}}}{\pi_\theta}\right] - \mathbb{E}_{\pi_\theta}\left[\log\frac{\pi_{\text{ref}}}{\pi_\theta}\right] - 1
 ```
-
-用Taylor展开近似：当 `r = π_ref/π_θ` 接近1时，`log(r) ≈ r - 1`，所以:
 
 ```math
-\text{KL} \approx \mathbb{E}[r - \log r - 1]
+= \int \pi_{\text{ref}}(a) \, da + \mathbb{E}_{\pi_\theta}\left[\log\frac{\pi_\theta}{\pi_{\text{ref}}}\right] - 1 = 1 + \text{KL}(\pi_\theta \| \pi_{\text{ref}}) - 1 = \text{KL}(\pi_\theta \| \pi_{\text{ref}})
 ```
 
-这个估计器方差更低，收敛更稳定。
+k3相比k1的优势：由 `x - log(x) - 1 ≥ 0` (对所有 `x > 0`)，k3**每个样本都非负**，而k1可以为负。这意味着k3的方差更低、训练更稳定。
 
 #### 🔧 代码实现
 
@@ -472,15 +478,17 @@ def kl_penalty(
     """
     计算KL惩罚项
     
-    【设计哲学】
-    - 不同估计器是无偏性和方差的权衡
-    - k1简单但有偏
-    - k2无偏但方差可能大
-    - k3在两者间取得平衡
+    【关键区分】值无偏 vs 梯度无偏
+    - k1, k3: KL值的无偏估计（E[estimator] = KL），但梯度有偏
+    - k2:     KL值有偏（E[k2] ≠ KL），但梯度无偏（E[∇k2] = ∇KL）
+    - 这意味着：如果你关心监控真实KL大小，用k1或k3
+    - 如果你关心优化方向正确性，用k2（或用k3+的straight-through trick）
     """
     
-    # ========== K1: Forward KL估计 ==========
-    # 最简单：直接算log概率差
+    # ========== K1: log-ratio KL估计 ==========
+    # k1 = log(π_θ/π_ref)
+    # E_π_θ[k1] = KL(π_θ || π_ref)，值无偏！
+    # 但单个样本可为负，方差较大
     if kl_penalty in ("kl", "k1"):
         return logprob - ref_logprob
     
@@ -490,14 +498,16 @@ def kl_penalty(
         return (logprob - ref_logprob).abs()
     
     # ========== K2: MSE估计 ==========
-    # 关键：这个估计器的梯度是无偏的！
-    # 即 E[∇k2] = ∇E[KL]，在梯度下降时很重要
+    # k2 = 0.5 * (log π_θ - log π_ref)²
+    # E_π_θ[k2] ≠ KL（值有偏！），但 E_π_θ[∇k2] = ∇KL（梯度无偏！）
+    # 这对基于梯度下降的优化很重要
     if kl_penalty in ("mse", "k2"):
         return 0.5 * (logprob - ref_logprob).square()
     
-    # ========== K3: 低方差KL估计 ==========
-    # 基于Taylor展开: KL ≈ r - log(r) - 1
-    # 优点：方差比k1低，同时保持正确的期望
+    # ========== K3: 非负低方差KL估计 ==========
+    # k3 = r - log(r) - 1，其中 r = π_ref/π_θ
+    # E_π_θ[k3] = KL(π_θ || π_ref)，值无偏！（精确等式，不是近似）
+    # 由 x - log(x) - 1 ≥ 0，k3 每个样本都非负，方差比k1低
     if kl_penalty in ("low_var_kl", "k3"):
         kl = ref_logprob - logprob  # log(π_ref/π_θ)
         kl = torch.clamp(kl, min=-20, max=20)  # 数值稳定
@@ -547,9 +557,10 @@ if config.use_kl_loss:
 #### 🎓 工程考虑 & 个人见解
 
 1. **k1 vs k2 vs k3，该用哪个？**
-   - **推荐k3**: 实践中方差低、稳定性好
-   - k1太简单，容易有梯度问题
-   - k2虽然无偏，但方差可能导致训练不稳定
+   - **推荐k3**: 值无偏 + 非负 + 低方差，实践中最稳定
+   - k1: 值无偏但可为负，方差大，且梯度有偏
+   - k2: 值有偏但梯度无偏，如果你特别在意优化方向的正确性可以用
+   - **k3+** (VeRL特有): 用straight-through trick，前向用k3的值，反向用k2的梯度，兼得两者优点
 
 2. **KL系数怎么设？**
    - 太小(0.001): KL约束太弱，模型可能"跑偏"
@@ -1284,9 +1295,10 @@ def agg_loss(
    - 这是无偏估计（组内均值不依赖当前样本）
 
 4. **KL penalty的k1/k2/k3有什么区别？**
-   - k1: 简单但有偏
-   - k2: 梯度无偏
-   - k3: 低方差，推荐使用
+   - 三者都服务于估计 KL(π_θ || π_ref)，但在**值无偏**和**梯度无偏**上各有取舍
+   - k1: KL值无偏（E[k1]=KL），但单样本可为负，梯度有偏
+   - k2: KL值有偏（E[k2]≠KL），但**梯度无偏**（E[∇k2]=∇KL）
+   - k3: KL值无偏（E[k3]=KL），且始终非负、方差比k1低，推荐使用
 
 5. **为什么要Whitening优势？**
    - 让优势scale稳定在[-3, 3]
