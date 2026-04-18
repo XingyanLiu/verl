@@ -39,6 +39,7 @@ from torch import nn
 from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
 from verl.utils.device import get_device_id, get_torch_device
+from verl.utils.import_utils import deprecated
 from verl.utils.megatron.pipeline_parallel import make_batch_generator
 from verl.utils.megatron.router_replay_patch import RouterReplay, RouterReplayAction
 from verl.utils.megatron.router_replay_utils import (
@@ -64,6 +65,7 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+@deprecated("legacy worker implementation is deprecated and will be removed in v0.8.0")
 class MegatronPPOActor(BasePPOActor):
     def __init__(
         self,
@@ -549,8 +551,10 @@ class MegatronPPOActor(BasePPOActor):
                 entropy = output["entropy"][:, -response_length - 1 : -1].contiguous()
                 if not forward_only:
                     entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                    stats["actor/entropy"] = entropy_loss.detach().item()
                     entropy_coeff = meta_info["entropy_coeff"]
-                    policy_loss = pg_loss - entropy_coeff * entropy_loss
+                    if entropy_coeff != 0:
+                        policy_loss = pg_loss - entropy_coeff * entropy_loss
                 else:
                     ret_entropy = entropy
 
@@ -786,7 +790,7 @@ class MegatronPPOActor(BasePPOActor):
                 # if use distributed optimizer, zero grad buffer will be handled by optimizer
                 chunk.zero_grad_buffer()
 
-            calculate_entropy = self.config.entropy_coeff != 0
+            calculate_entropy = self.config.get("calculate_entropy", False) or (self.config.entropy_coeff != 0)
             if data.meta_info.get("micro_batch_size", None) is not None:
                 micro_batch_size = data.meta_info["micro_batch_size"]
             else:

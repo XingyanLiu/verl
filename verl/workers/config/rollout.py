@@ -13,7 +13,7 @@
 # limitations under the License.
 import warnings
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 from omegaconf import MISSING
 
@@ -33,7 +33,25 @@ __all__ = [
     "RolloutConfig",
     "DiffusionRolloutConfig",
     "CheckpointEngineConfig",
+    "SkipConfig",
 ]
+
+
+@dataclass
+class SkipConfig(BaseConfig):
+    """
+    Configuration for rollout skip: load/dump previously generated rollout data
+    instead of computing new rollouts (e.g. for debugging or reuse).
+    """
+
+    enable: bool = False
+    dump_dir: str = "~/.verl/rollout_dump"
+    max_dump_step: int = 1
+    action: str = "cache"  # cache | repeat | repeat_last
+
+    def get(self, key: str, default=None):
+        """Dict-like get for compatibility with code that uses skip.get('enable', False)."""
+        return getattr(self, key, default)
 
 
 @dataclass
@@ -46,12 +64,10 @@ class SamplingConfig(BaseConfig):
 
 
 @dataclass
-class DiffusionSamplingConfig(BaseConfig):
-    do_sample: bool = True
-    n: int = 1
-    noise_level: float = 0.0
+class DiffusionSamplingConfig(SamplingConfig):
     num_inference_steps: int = 40
     seed: int = 42
+    extra_configs: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -143,6 +159,10 @@ class CheckpointEngineConfig(BaseConfig):
     update_weights_bucket_megabytes: int = 2048
     # Additional keyword arguments for checkpoint engine
     engine_kwargs: dict = field(default_factory=dict)
+    # If set, this Python module is imported on every worker process before the
+    # backend is instantiated, allowing custom backends to register themselves
+    # in CheckpointEngineRegistry.
+    custom_backend_module: Optional[str] = None
 
 
 @dataclass
@@ -227,12 +247,15 @@ class RolloutConfig(BaseConfig):
     # Extension point for custom configurations
     custom: Optional[dict] = None
 
+    # Fully qualified class name for a custom CheckpointEngineManager. When set, the trainer
+    # loads this class instead of the built-in CheckpointEngineManager.
+    checkpoint_manager_class: Optional[str] = None
+
     # Checkpoint Engine config for update weights from trainer to rollout
     checkpoint_engine: CheckpointEngineConfig = field(default_factory=CheckpointEngineConfig)
 
-    skip_rollout: bool = False
-
-    skip_dump_dir: str = "/tmp/rollout_dump"
+    # Rollout skip config (load/dump rollout data)
+    skip: SkipConfig = field(default_factory=SkipConfig)
 
     profiler: Optional[ProfilerConfig] = None
 
@@ -325,7 +348,7 @@ class DiffusionRolloutConfig(RolloutConfig):
 
     num_inference_steps: int = 10
 
-    guidance_scale: float = 4.5
+    extra_configs: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         """Validate diffusion rollout config"""

@@ -34,7 +34,6 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 
 from verl import DataProto
-from verl.checkpoint_engine import CheckpointEngineManager
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup, ResourcePoolManager
@@ -70,7 +69,7 @@ from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
-from verl.workers.config import DistillationConfig, FSDPEngineConfig
+from verl.workers.config import DistillationConfig, EngineConfig
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
 
@@ -724,16 +723,13 @@ class RayPPOTrainer:
                 from verl.workers.engine_workers import TrainingWorkerConfig
 
                 orig_critic_cfg = critic_cfg
-                if orig_critic_cfg.strategy == "fsdp":
-                    engine_config: FSDPEngineConfig = orig_critic_cfg.model.fsdp_config
-                    engine_config.infer_max_token_len_per_gpu = critic_cfg.ppo_infer_max_token_len_per_gpu
-                    engine_config.max_token_len_per_gpu = critic_cfg.ppo_max_token_len_per_gpu
-                else:
-                    raise NotImplementedError(f"Unknown strategy {orig_critic_cfg.strategy=}")
+                engine_config: EngineConfig = orig_critic_cfg.engine
+                engine_config.infer_max_token_len_per_gpu = critic_cfg.ppo_infer_max_token_len_per_gpu
+                engine_config.max_token_len_per_gpu = critic_cfg.ppo_max_token_len_per_gpu
 
                 critic_cfg = TrainingWorkerConfig(
                     model_type="value_model",
-                    model_config=orig_critic_cfg.model_config,
+                    model_config=orig_critic_cfg.model,
                     engine_config=engine_config,
                     optimizer_config=orig_critic_cfg.optim,
                     checkpoint_config=orig_critic_cfg.checkpoint,
@@ -870,7 +866,14 @@ class RayPPOTrainer:
             reward_loop_worker_handles=reward_loop_worker_handles,
             teacher_model_manager=self.teacher_model_manager,
         )
+
         checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
+        # Support custom CheckpointEngineManager via config
+        checkpoint_manager_class_fqn = self.config.actor_rollout_ref.rollout.get("checkpoint_manager_class")
+        if checkpoint_manager_class_fqn:
+            CheckpointEngineManager = load_class_from_fqn(checkpoint_manager_class_fqn, "CheckpointEngineManager")
+        else:
+            from verl.checkpoint_engine import CheckpointEngineManager
         self.checkpoint_manager = CheckpointEngineManager(
             config=checkpoint_engine_config,
             trainer=self.actor_rollout_wg,
@@ -1210,7 +1213,9 @@ class RayPPOTrainer:
             batch_td = batch.to_tensordict()
             # step 2: convert from padding to no-padding
             batch_td = left_right_2_no_padding(batch_td)
-            calculate_entropy = self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
+            calculate_entropy = self.config.actor_rollout_ref.actor.calculate_entropy or (
+                self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
+            )
             distillation_use_topk = (
                 self.distillation_config.distillation_loss.loss_settings.use_topk
                 if is_distillation_enabled(self.config.get("distillation"))
@@ -1309,7 +1314,7 @@ class RayPPOTrainer:
             if self.config.trainer.get("val_only", False):
                 return
 
-        if self.config.actor_rollout_ref.rollout.get("skip_rollout", False):
+        if self.config.actor_rollout_ref.rollout.skip.get("enable", False):
             rollout_skip = RolloutSkip(self.config, self.async_rollout_manager)
             rollout_skip.wrap_generate_sequences()
 
@@ -1547,7 +1552,10 @@ class RayPPOTrainer:
                         metrics.update(critic_output_metrics)
 
                     # implement critic warmup
-                    if self.config.trainer.critic_warmup <= self.global_steps:
+                    if self.config.trainer.critic_warmup > self.global_steps:
+                        # Still in critic warmup, only update weights to wake up rollout replicas.
+                        self.checkpoint_manager.update_weights(self.global_steps)
+                    else:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
                             actor_output = self._update_actor(batch)
