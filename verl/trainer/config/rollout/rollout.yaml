@@ -173,8 +173,19 @@ multi_turn:
   # null for no limit (default max_length // 3)
   max_assistant_turns: null
 
-  # null for no tool
+  # YAML config for stateful tools that subclass ``BaseTool``.
+  # Use this when a tool needs per-trajectory state, async ``create``/``release``
+  # lifecycle hooks, or custom rewards.
+  # null disables this code path.
   tool_config_path: null
+
+  # Path to a Python file with ``@function_tool``-decorated functions, loaded
+  # once per ``AgentLoopWorker``. Use this for stateless tools where the
+  # OpenAI-compatible JSON schema can be inferred from the function signature
+  # and Google-style docstring. Coexists with ``tool_config_path``; name
+  # collisions across the two raise an error.
+  # null disables this code path.
+  function_tool_path: null
 
   # null for no limit (default max_length // 3)
   max_user_turns: null
@@ -211,7 +222,7 @@ multi_turn:
 
 # support logging rollout prob for debugging purpose
 # "Truncated importance sampling" requires rollout log probs, set to True when turning on Truncated importance sampling
-calculate_log_probs: False
+calculate_log_probs: True
 
 # [Experimental] agent loop based rollout configs
 agent:
@@ -292,7 +303,7 @@ trace:
   # Experiment name for run identification in tracking tools
   experiment_name: ${oc.select:trainer.experiment_name,null}
 
-  # trace backend, support mlflow, weave
+  # trace backend, support mlflow, weave, trackio
   backend: null
 
   # whether translate token id to text in output
@@ -304,29 +315,6 @@ trace:
   # Total traces per step = max_samples_per_step_per_worker * num_workers * n_rollouts_per_sample
   max_samples_per_step_per_worker: null
 
-# rollout skip config (load/dump rollout data)
-skip:
-
-  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
-  _target_: verl.workers.config.SkipConfig
-
-  # When enabled (True), the trainer will attempt to load previously generated rollout data from the specified directory instead of computing new rollouts.
-  # If no cached data is found or loading fails, new rollouts will be generated and automatically saved.
-  # This feature is useful for debugging or when you want to reuse computation results across multiple runs.
-  enable: False
-
-  # Default ~/.verl/rollout_dump (expanduser+resolve at runtime). Ray/multi-node: prefer absolute dump_dir (relative paths follow each process cwd).
-  # Avoid /tmp/ray/session* (ephemeral).
-  dump_dir: "~/.verl/rollout_dump"
-
-  # Number of training steps (from start) for which dump/load is active. Steps with train_step <= max_dump_step are "dump steps" (try load first, then generate and dump if missing).
-  max_dump_step: 1
-
-  # Action when beyond dump steps (gen_step > max_dump_step):
-  # - "cache": If dumped data exists for current step, use it; otherwise generate and dump.
-  # - "repeat": Reuse dumped data in a round-robin over the first max_dump_step steps.
-  # - "repeat_last": Reuse the last dumped step's data.
-  action: "cache"
 
 # Whether to skip tokenizer initialization for rollout engine
 # When enabled (True), the rollout assume token in token out for generation
@@ -381,6 +369,14 @@ profiler:
       # True for each task has its own database, False for all tasks in one training step share one database.
       discrete: ${oc.select:actor_rollout_ref.actor.profiler.tool_config.npu.discrete,false}
 
+      # Start collecting profiler data from this response-token index.
+      # null means collect from the first response token (full collection start).
+      profile_token_start: null
+
+      # Stop collecting profiler data at this response-token index (exclusive).
+      # null means collect until the end (full collection).
+      profile_token_end: null
+
     # torch profiler config
     torch:
 
@@ -393,6 +389,15 @@ profiler:
 
       # True for each task has its own database, False for all tasks in one training step share one database.
       discrete: ${oc.select:actor_rollout_ref.actor.profiler.tool_config.torch.discrete,false}
+
+      # Start collecting profiler data from this response-token index.
+      # null means collect from the first response token (full collection start).
+      profile_token_start: null
+
+      # Stop collecting profiler data at this response-token index (exclusive).
+      # null means collect until the end (full collection).
+      profile_token_end: null
+
 
     # msprobe precision debugger config
     precision_debugger:
@@ -443,3 +448,27 @@ mtp: ${oc.select:actor_rollout_ref.model.mtp, null}
 
 # QAT configuration (inherited from actor's engine config)
 qat: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat,${oc.select:actor_rollout_ref.actor.megatron.qat,null}}
+
+# Prefill-Decode disaggregation (SGLang only; keep rollout.name=sglang and toggle enabled=True).
+disaggregation:
+
+  # Master switch for PD disaggregation.
+  enabled: False
+
+  # Number of prefill replicas (each uses tensor_model_parallel_size GPUs).
+  prefill_replicas: 1
+
+  # Number of decode replicas.
+  decode_replicas: 1
+
+  # Decode TP override; null = same as tensor_model_parallel_size.
+  decode_tensor_model_parallel_size: null
+
+  # KV cache transport: nixl | mooncake | ascend | mori | fake.
+  transfer_backend: nixl
+
+  # Bootstrap server port on prefill side; null = auto-assign.
+  bootstrap_port: null
+
+  # InfiniBand device (required for mooncake over RDMA).
+  ib_device: null

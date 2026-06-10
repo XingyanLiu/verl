@@ -69,6 +69,18 @@ class DistillationLossConfig(BaseConfig):
     loss_max_clamp: Optional[float] = 10.0
     log_prob_min_clamp: Optional[float] = -10.0
 
+    # Chunked top-K log-probs (opt-in, avoids [B, T, V] log_softmax buffer
+    # at long context). Only consumed by ``loss_mode='forward_kl_topk'``.
+    # Default ``False`` to preserve short-context performance (chunked path
+    # has ~6x time overhead at N=14K, V=152K). Set ``True`` when hitting OOM
+    # at long context (>=64K tokens, V=152K) where the baseline path OOMs.
+    use_chunked_topk: bool = False
+    # Tokens per chunk along (B*T) when ``use_chunked_topk=True``. Larger
+    # chunks reduce kernel-launch overhead but increase per-chunk memory;
+    # smaller chunks reduce per-chunk memory but increase kernel-launch
+    # overhead (saved-tensor total stays constant either way).
+    chunked_topk_chunk_size: int = 4096
+
     use_policy_gradient: bool = True
     policy_loss_mode: str = "vanilla"
     clip_ratio: float = 0.2
@@ -194,6 +206,12 @@ class DistillationTeacherModelConfig(BaseConfig):
                         f"({topk}) to enable distillation loss computation."
                     )
                 engine_kwargs["vllm"] = vllm_engine_kwargs
+            case "sglang":
+                # SGLang's top_logprobs_num is a per-request parameter, so there is no
+                # engine-boot cap to align (unlike vLLM's max_logprobs). The async
+                # server translates sampling_params["prompt_logprobs"] into
+                # return_logprob + logprob_start_len=0 + top_logprobs_num at call time.
+                pass
             case _:
                 raise NotImplementedError(
                     f"DistillationTeacherModelConfig does not support inference engine {engine_name}"
